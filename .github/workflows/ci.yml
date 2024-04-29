@@ -9,22 +9,24 @@ on:
 jobs:
   frontend-test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./quiz-app
     strategy:
       matrix:
-        node-version: [14.x]
+        node-version: [20.x]
+        architecture: [x64]
     steps:
       - name: Check-out git repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v2
-        with:
-          node-version: ${{ matrix.node-version }}
+      - name: USE NODEJS ${{ matrix.node-version }} - ${{ matrix.architecture }}
+        uses: actions/setup-node@v4
 
-      - name: Install project dependencies and run tests
+      - name: Install project dependencies
+        working-directory: ./quiz-app
         run: |
-          cd quiz-app
-          npm install
+          npm i
           npm run lint
           npm install --save-dev --save-exact prettier
           npm run prettier
@@ -33,17 +35,18 @@ jobs:
           CI: true
 
       - name: Build
-        run: |
-          cd quiz-app
-          npm run build
+        run: npm run build
+        working-directory:
+          ./quiz-app
 
+          # Setup sonar-scanner
       - name: Setup SonarQube
         uses: warchant/setup-sonar-scanner@v8
 
       - name: Analyze with SonarCloud
         uses: sonarsource/sonarcloud-github-action@master
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets._GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           projectBaseDir: quiz-app
@@ -57,36 +60,40 @@ jobs:
 
   backend-test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend
     strategy:
       matrix:
-        node-version: [14.x]
+        node-version: [20.x]
+        architecture: [x64]
     steps:
       - name: Check-out git repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v2
-        with:
-          node-version: ${{ matrix.node-version }}
+      - name: USE NODEJS ${{ matrix.node-version }} - ${{ matrix.architecture }}
+        uses: actions/setup-node@v4
 
-      - name: Install project dependencies and run tests
+      - name: Install project dependencies
+        working-directory: ./backend
         run: |
-          cd backend
-          npm install
+          npm i
           npm run lint
           npm install --save-dev --save-exact prettier
           npm run prettier
           npm test
         env:
-          CI: true
+          CI:
+            true
 
+            # Setup sonar-scanner
       - name: Setup SonarQube
         uses: warchant/setup-sonar-scanner@v8
 
       - name: Analyze with SonarCloud
         uses: sonarsource/sonarcloud-github-action@master
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets._GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           projectBaseDir: backend
@@ -98,13 +105,73 @@ jobs:
             -Dsonar.sources=.
             -Dsonar.verbose=true
 
-  frontend-image:
+  frontend-security:
     needs: frontend-test
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./quiz-app
+    steps:
+      - uses: actions/checkout@master
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        continue-on-error: true # To make sure that SARIF upload gets called
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Install Snyk CLI
+        uses: snyk/actions/setup@master
+        with:
+          version: latest
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Snyk Authenticate
+        run: snyk auth ${{ secrets.SNYK_TOKEN }}
+
+      - name: Snyk Code Test
+        run: snyk code test --all-projects
+        continue-on-error: true
+
+  backend-security:
+    needs: backend-test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend
+    steps:
+      - uses: actions/checkout@master
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        continue-on-error: true # To make sure that SARIF upload gets called
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Install Snyk CLI
+        uses: snyk/actions/setup@master
+        with:
+          version: latest
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Snyk Authenticate
+        run: snyk auth ${{ secrets.SNYK_TOKEN }}
+
+      - name: Snyk Code Test
+        run: snyk code test --all-projects
+        continue-on-error: true
+
+  frontend-image:
+    needs: frontend-security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build and push frontend Docker image
+      - name: Build and push backend Docker image
         working-directory: ./quiz-app
         run: |
           docker build . -t ${{ secrets.DOCKER_USERNAME }}/frontend-js
@@ -119,9 +186,34 @@ jobs:
           output: "trivy-results.sarif"
           severity: "CRITICAL,HIGH"
 
+      - name: Install Snyk CLI
+        uses: snyk/actions/setup@master
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Snyk Authenticate
+        run: snyk auth ${{ secrets.SNYK_TOKEN }}
+
+      - name: Snyk Container monitor
+        run: snyk container monitor ${{ secrets.DOCKER_USERNAME }}/frontend-js --file=Dockerfile
+        working-directory: ./quiz-app
+
+      - name: Run Snyk to check for vulnerabilities in the Docker image
+        uses: snyk/actions/docker@master
+        with:
+          image: ${{ secrets.DOCKER_USERNAME }}/frontend-js
+          args: --file=quiz-app/Dockerfile --severity-threshold=high
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        continue-on-error: true
+
   backend-image:
-    needs: backend-test
+    needs: backend-security
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
@@ -140,8 +232,29 @@ jobs:
           output: "trivy-results.sarif"
           severity: "CRITICAL,HIGH"
 
+      - name: Install Snyk CLI
+        uses: snyk/actions/setup@master
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Snyk Authenticate
+        run: snyk auth ${{ secrets.SNYK_TOKEN }}
+
+      - name: Snyk Container monitor
+        run: snyk container monitor ${{ secrets.DOCKER_USERNAME }}/backend-api --file=Dockerfile
+        working-directory: ./backend
+
+      - name: Run Snyk to check for vulnerabilities in the Docker image
+        uses: snyk/actions/docker@master
+        with:
+          image: ${{ secrets.DOCKER_USERNAME }}/backend-api
+          args: --file=backend/Dockerfile --severity-threshold=high
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        continue-on-error: true
+
   k8s-manifest-scan:
-    needs: [backend-test, frontend-test]
+    needs: [backend-security, frontend-security]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
